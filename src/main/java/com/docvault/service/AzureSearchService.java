@@ -2,6 +2,7 @@ package com.docvault.service;
 
 import com.azure.search.documents.SearchClient;
 import com.azure.search.documents.SearchClientBuilder;
+import com.azure.search.documents.SearchDocument;
 import com.azure.search.documents.models.*;
 import com.azure.core.credential.AzureKeyCredential;
 import com.docvault.dto.SearchRequestDto;
@@ -70,14 +71,6 @@ public class AzureSearchService {
         if (req.getDateTo()     != null) filters.add("uploadedAt le " + req.getDateTo()   + "T23:59:59Z");
         if (!filters.isEmpty()) opts.setFilter(String.join(" and ", filters));
 
-        // Semantic ranking if enabled on the index
-        try {
-            opts.setQueryType(QueryType.SEMANTIC)
-                .setSemanticConfigurationName("docvault-semantic");
-        } catch (Exception ignored) {
-            // Falls back to full-text if semantic config not provisioned
-        }
-
         var results = searchClient.search(
                 req.getQ() != null ? req.getQ() : "*", opts, null);
 
@@ -93,7 +86,7 @@ public class AzureSearchService {
             item.setMimeType((String) doc.get("mimeType"));
             item.setFileSizeBytes(doc.get("fileSizeBytes") instanceof Number n ? n.longValue() : 0);
             item.setUploadedAt((String) doc.get("uploadedAt"));
-            item.setScore(r.getScore() != null ? r.getScore() : 0.0);
+            item.setScore(r.getScore());
             if (r.getHighlights() != null) {
                 item.setHighlights(r.getHighlights());
             }
@@ -105,7 +98,14 @@ public class AzureSearchService {
         if (results.getFacets() != null) {
             results.getFacets().forEach((facet, values) -> {
                 List<Map<String, Object>> fv = new ArrayList<>();
-                values.forEach(v -> fv.add(Map.of("value", v.getValue(), "count", v.getCount())));
+                values.forEach(v -> {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("count", v.getCount());
+                    if (v.getAdditionalProperties() != null) {
+                        entry.putAll(v.getAdditionalProperties());
+                    }
+                    fv.add(entry);
+                });
                 facets.put(facet, fv);
             });
         }
@@ -142,7 +142,7 @@ public class AzureSearchService {
 
     // ── Delete from index ─────────────────────────────────────────────────
     public void deleteDocument(String id) {
-        searchClient.deleteDocuments("id", List.of(id));
+        searchClient.deleteDocuments(List.of(Map.of("id", id)));
         log.debug("[Search] Deleted from index: {}", id);
     }
 
