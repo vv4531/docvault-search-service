@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: search-service
+
+server:
+  port: 8081
+
+azure:
+  search:
+    endpoint:  ${AZURE_SEARCH_ENDPOINT:https://docvault-search.search.windows.net}
+    api-key:   ${AZURE_SEARCH_API_KEY:}
+    index:     documents
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.docvault: DEBUG
+    com.azure:    WARN
