@@ -1,113 +1,166 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Repository Layout
-
-This is a multi-repo project. The four services live in sibling directories:
-
-```
-docvault/
-├── docvault-frontend/              # React SPA (port 3000)
-├── docvault-bff/                   # Node.js BFF (port 4000)
-├── documentservice/
-│   └── docvault-document-service/  # Spring Boot (port 8080)
-└── docvault-search-service/        # Spring Boot (this repo, port 8081)
-```
-
-## Commands
-
-```bash
-mvn test                            # run all tests
-mvn test -Dtest=SearchServiceTest   # run a single test class
-mvn package -DskipTests             # build JAR → target/*.jar
-mvn spring-boot:run                 # run locally (requires Azure env vars below)
-```
+# DocVault — Claude Code Context
 
 ## Architecture
 
-### Request Flow
 ```
-Browser → React SPA (3000)
-       → BFF /api/search (4000)
-         → Search Service /v1/search (8081)   ← this repo
-           → Azure AI Search (index: documents)
-
-Document Service (8080) → POST /v1/search/index  [async, after upload]
-                       → DELETE /v1/search/{id}  [on document delete]
-```
-
-### Source Layout
-```
-src/main/java/com/docvault/
-├── controller/   SearchController.java   @RequestMapping("/v1/search")
-├── service/      AzureSearchService.java (index management, search, suggest)
-├── dto/          SearchRequestDto, SearchResponseDto, SearchResultItem
-└── SearchServiceApplication.java
+Browser → nginx (docvault-frontend :80)
+             → /api/* proxy → BFF (docvault-bff :4000)
+                                → http://docvault-document-service  (Spring Boot :8080)
+                                → http://docvault-search-service    (Spring Boot :8081)
+                                        ↕
+                               Azure Blob Storage (docvaultstor)
+                               Azure Cosmos DB    (docvault-cosmosdb / DocVaultDB)
+                               Azure AI Search    (docvault-search / index: documents)
 ```
 
-### API Endpoints
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/v1/search` | Full-text search with semantic ranking and facets |
-| `GET` | `/v1/search/suggest` | Autocomplete suggestions (min 2 chars) |
-| `POST` | `/v1/search/index` | Index or re-index a document (called by Document Service) |
-| `DELETE` | `/v1/search/{id}` | Remove document from index |
+All 4 services run in **Azure Container Apps** (ACA), resource group `docvault-rg`, environment `docvault-env` (FQDN suffix `niceisland-3b1d4e0d.eastus.azurecontainerapps.io`).
 
-**Search query params**: `q` (query string), `department`, `tier`, `dateFrom`, `dateTo`, `from` (offset, default 0), `size` (page size, default 20)
+## Repositories
 
-Swagger UI: `http://localhost:8081/swagger-ui.html`
+| Service | Repo | GitHub |
+|---------|------|--------|
+| Frontend (React + nginx) | `docvault-frontend/` | `vv4531/docvault-frontend` |
+| BFF (Node.js/Express) | `docvault-bff/` | `vv4531/docvault-bff` |
+| Document Service (Spring Boot) | `documentservice/docvault-document-service/` | `vv4531/docvault-document-service` |
+| Search Service (Spring Boot) | `docvault-search-service/` | `vv4531/docvault-search-service` |
 
-## Key Patterns
+## ACA Internal Hostnames
 
-### Index Auto-Creation
-`AzureSearchService.ensureIndex()` is annotated `@PostConstruct` and runs at startup. It creates the `documents` index with a suggester if it does not already exist. No manual index creation is needed.
+Services communicate via ACA internal DNS — **always use these, never external FQDNs**:
 
-The index fields include: `id`, `title`, `content`, `extractedText`, `department`, `tier`, `uploadedAt`, plus any other fields sent by Document Service in the index payload.
+| Service | Internal URL |
+|---------|-------------|
+| Document Service | `http://docvault-document-service` |
+| Search Service | `http://docvault-search-service` |
 
-### Indexing Documents
-Document Service calls `POST /v1/search/index` asynchronously after upload. The request body is a `Map<String, Object>` containing all document fields, including `extractedText` from Apache Tika.
+The BFF cannot use internal DNS for itself (nginx proxy must use the external HTTPS FQDN — see nginx.conf).
 
-```java
-// SearchController
-@PostMapping("/index")
-public ResponseEntity<Void> indexDocument(@RequestBody Map<String, Object> document)
+## Environment Variables
+
+### BFF (`docvault-bff`)
+```
+DOCUMENT_SERVICE_URL=http://docvault-document-service
+SEARCH_SERVICE_URL=http://docvault-search-service
+FRONTEND_URL=https://docvault-frontend.niceisland-3b1d4e0d.eastus.azurecontainerapps.io
 ```
 
-### Semantic Ranking
-Search uses Azure AI Search's semantic ranking for relevance. Faceted results include `department` and `tier` buckets in the response.
+### Document Service (`docvault-document-service`)
+```
+AZURE_STORAGE_ACCOUNT_NAME=docvaultstor
+AZURE_STORAGE_ACCOUNT_KEY=<key>
+AZURE_COSMOS_ENDPOINT=https://docvault-cosmosdb.documents.azure.com:443/
+AZURE_COSMOS_KEY=<key>
+SEARCH_SERVICE_URL=http://docvault-search-service
+```
 
-### Suggester
-Autocomplete is configured on the `title` and `content` fields. The `GET /v1/search/suggest?q=<prefix>` endpoint requires at least 2 characters.
+### Search Service (`docvault-search-service`)
+```
+AZURE_SEARCH_ENDPOINT=https://docvault-search.search.windows.net
+AZURE_SEARCH_API_KEY=<key>
+```
 
-## Configuration
+## GitHub Org Secrets (required for CI)
 
-### application.yml highlights
-- Server port: **8081**
-- Azure Search index name: `documents`
-- Actuator endpoints: `/actuator/health`, `/actuator/metrics`, `/actuator/prometheus`
-- Logging: DEBUG for `com.docvault`, WARN for Azure SDK
+Set these at the org level so all repo CIs can use them:
 
-### Required Environment Variables
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AZURE_SEARCH_ENDPOINT` | `https://docvault-search.search.windows.net` | Azure AI Search endpoint |
-| `AZURE_SEARCH_API_KEY` | — | Search service API key |
+```
+AZURE_CREDENTIALS          # Service principal JSON for az login
+AZURE_RESOURCE_GROUP       # docvault-rg
+GHCR_TOKEN                 # GitHub PAT for container registry
+AZURE_STORAGE_ACCOUNT_NAME # docvaultstor
+AZURE_STORAGE_ACCOUNT_KEY  # Storage account key
+AZURE_COSMOS_ENDPOINT      # https://docvault-cosmosdb.documents.azure.com:443/
+AZURE_COSMOS_KEY            # Cosmos DB key
+AZURE_SEARCH_ENDPOINT      # https://docvault-search.search.windows.net
+AZURE_SEARCH_API_KEY        # Azure AI Search admin key
+DOCUMENT_SERVICE_URL        # http://docvault-document-service
+SEARCH_SERVICE_URL          # http://docvault-search-service
+```
 
-## CI/CD
+## Key Files
 
-GitHub Actions (`.github/workflows/ci.yml`):
-1. `mvn test` — must pass
-2. Build + push Docker image → `ghcr.io/<owner>/docvault-search-service:latest` and `:<sha>`
-3. Deploy to Azure Container App: `docvault-search-service` in `docvault-dev-rg`
-4. Sets `SEARCH_SERVICE_URL` on the Document Service Container App so it can call back here
+### Frontend
+- `docvault-frontend/nginx.conf` — SPA + `/api` reverse proxy to BFF external HTTPS FQDN
+  - Uses `resolver 8.8.8.8` (public DNS, required in ACA — `127.0.0.11` doesn't work)
+  - Uses `set $bff_upstream https://...` variable + `proxy_ssl_server_name on` for dynamic HTTPS proxy
 
-**Required GitHub Secrets**: `AZURE_CREDENTIALS`, `AZURE_RESOURCE_GROUP`, `GHCR_TOKEN`
+### BFF
+- `docvault-bff/src/server.js` — Express app; `app.set('trust proxy', 1)` is required for ACA (load balancer sets X-Forwarded-For)
+- `docvault-bff/src/services/apimClient.js` — Routes `/documents/v1/*` → docClient, `/search/v1/*` → searchClient
+- `docvault-bff/src/routes/documents.js` — Converts 1-based frontend page to 0-based Spring Pageable (`page: page - 1`)
 
-## Docker
+### Document Service
+- `src/main/java/com/docvault/service/DocumentService.java` — Upload pipeline + async AI Search indexing
+- `src/main/java/com/docvault/service/BlobStorageService.java` — Azure Blob operations; upload uses `ByteArrayInputStream` (required for Azure SDK mark/reset)
+- `src/main/java/com/docvault/repository/DocumentRepositoryCustomImpl.java` — Raw Cosmos DB queries
 
-Multi-stage build: Maven 3.9 builder → Eclipse Temurin 21 JRE runtime.
-- Non-root user: `spring`
-- JVM flags: `-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0`
-- Healthcheck: `GET /actuator/health` (30s interval, 5s timeout)
-- Exposes port **8081**
+### Search Service
+- `src/main/java/com/docvault/service/AzureSearchService.java` — Creates index on startup, full-text search + facets
+
+## Common Operations
+
+### Re-index all documents into Azure AI Search
+```bash
+curl -X POST "https://docvault-bff.niceisland-3b1d4e0d.eastus.azurecontainerapps.io/api/documents/reindex"
+```
+Run this after any search service outage or if search returns empty results.
+
+### Fix broken env vars on BFF (after bad CI deploy)
+```bash
+az containerapp update \
+  --name docvault-bff \
+  --resource-group docvault-rg \
+  --set-env-vars \
+    DOCUMENT_SERVICE_URL="http://docvault-document-service" \
+    SEARCH_SERVICE_URL="http://docvault-search-service"
+```
+
+### Check env vars on a container
+```bash
+az containerapp show \
+  --name docvault-bff \
+  --resource-group docvault-rg \
+  --query "properties.template.containers[0].env"
+```
+
+### Stream logs
+```bash
+az containerapp logs show --name docvault-bff --resource-group docvault-rg --follow
+az containerapp logs show --name docvault-document-service --resource-group docvault-rg --follow
+az containerapp logs show --name docvault-search-service --resource-group docvault-rg --follow
+```
+
+## Known Issues & Fixes Applied
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| `mark/reset not supported` on upload | Azure SDK retries require seekable stream | Use `ByteArrayInputStream(file.getBytes())` |
+| `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` | ACA load balancer sets X-Forwarded-For but Express trust proxy not set | `app.set('trust proxy', 1)` in server.js |
+| `415 Unsupported Media Type` on search index POST | RestTemplate sends `Map` as `application/x-www-form-urlencoded` by default | Wrap in `HttpEntity` with `Content-Type: application/json` header |
+| Dashboard list empty | Frontend sends 1-based page, Spring Pageable is 0-based | BFF converts: `page: page - 1` |
+| CI wipes env vars | GitHub secrets empty → `az containerapp update` sets empty values | Guard condition: only update if secrets are non-empty |
+| nginx 502 to BFF | BFF has `allowInsecure: false` (HTTPS only), nginx was using HTTP | nginx must proxy to external HTTPS FQDN |
+| Search returns 0 results after reindex | `RestTemplate.postForEntity` with Map sends wrong Content-Type | Fixed with HttpEntity + explicit Content-Type |
+| `CredentialUnavailableException` at startup | Empty Azure credential env vars from CI | Set via Cloud Shell, add guard to CI |
+
+## CI/CD Notes
+
+- Each service has its own GitHub Actions workflow in `.github/workflows/ci.yml`
+- All CIs have guards: only update env vars if GitHub secrets are non-empty (prevents wiping manual values)
+- BFF CI guard: `if [ -n "$DOC_URL" ] && [ -n "$SRCH_URL" ]`
+- Document service CI guard: `if [ -n "$STORAGE_ACCOUNT" ] && [ -n "$STORAGE_KEY" ] && ...`
+- Search service CI guard: `if [ -n "$SRCH_ENDPOINT" ] && [ -n "$SRCH_KEY" ]`
+- `azure/container-apps-deploy-action` preserves existing env vars when only updating image
+
+## Azure Resources
+
+| Resource | Name |
+|----------|------|
+| Resource Group | `docvault-rg` |
+| ACA Environment | `docvault-env` |
+| Storage Account | `docvaultstor` |
+| Blob Containers | `documents-hot`, `documents-cold` |
+| Cosmos DB Account | `docvault-cosmosdb` |
+| Cosmos DB / Container | `DocVaultDB` / `documents` |
+| AI Search Service | `docvault-search` |
+| AI Search Index | `documents` |
